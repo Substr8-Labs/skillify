@@ -53,6 +53,22 @@ DOC_FILES = [
     "docs/README.md", "docs/index.md",
 ]
 
+# Patterns that indicate LLM API calls (need to be replaced with sessions_spawn)
+LLM_PATTERNS = [
+    (r"anthropic\.Anthropic", "anthropic"),
+    (r"anthropic\.messages\.create", "anthropic"),
+    (r"openai\.OpenAI", "openai"),
+    (r"openai\.chat\.completions", "openai"),
+    (r"from anthropic import", "anthropic"),
+    (r"from openai import", "openai"),
+    (r"import anthropic", "anthropic"),
+    (r"import openai", "openai"),
+    (r"claude-3", "anthropic"),
+    (r"gpt-4", "openai"),
+    (r"ANTHROPIC_API_KEY", "anthropic"),
+    (r"OPENAI_API_KEY", "openai"),
+]
+
 CONFIG_FILES = {
     "python": ["pyproject.toml", "setup.py", "setup.cfg"],
     "node": ["package.json", "tsconfig.json"],
@@ -214,6 +230,235 @@ def extract_key_files(repo_path: Path) -> dict[str, str]:
                 pass
     
     return key_files
+
+
+def detect_llm_usage(repo_path: Path) -> dict:
+    """Detect LLM API usage in the codebase."""
+    findings = {
+        "has_llm_calls": False,
+        "providers": set(),
+        "files": [],
+    }
+    
+    # Only scan code files
+    code_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".rs", ".go"}
+    
+    for file_path in repo_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix not in code_extensions:
+            continue
+        # Skip common non-source dirs
+        if any(p in file_path.parts for p in [".git", "node_modules", ".venv", "venv", "__pycache__"]):
+            continue
+        
+        try:
+            content = file_path.read_text(errors="ignore")
+            for pattern, provider in LLM_PATTERNS:
+                if re.search(pattern, content):
+                    findings["has_llm_calls"] = True
+                    findings["providers"].add(provider)
+                    rel_path = str(file_path.relative_to(repo_path))
+                    if rel_path not in findings["files"]:
+                        findings["files"].append(rel_path)
+                    break  # One match per file is enough
+        except (IOError, UnicodeDecodeError):
+            pass
+    
+    findings["providers"] = list(findings["providers"])
+    return findings
+
+
+def generate_init_sh(project_types: list[str], metadata: dict) -> str:
+    """Generate init.sh setup script."""
+    name = metadata["name"]
+    script = '''#!/bin/bash
+# Skill initialization script
+# Run once to set up dependencies
+
+set -e
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENDOR_DIR="$SKILL_DIR/vendor"
+
+echo "Setting up skill: ''' + name + '''..."
+
+cd "$VENDOR_DIR"
+
+'''
+    
+    if "python" in project_types:
+        script += '''# Python setup
+if [ ! -d "$SKILL_DIR/.venv" ]; then
+    echo "Creating Python virtual environment..."
+    python3 -m venv "$SKILL_DIR/.venv"
+fi
+
+source "$SKILL_DIR/.venv/bin/activate"
+
+if [ -f "requirements.txt" ]; then
+    echo "Installing Python dependencies..."
+    pip install -q -r requirements.txt
+elif [ -f "pyproject.toml" ]; then
+    echo "Installing Python package..."
+    pip install -q -e .
+fi
+
+'''
+    
+    if "node" in project_types:
+        script += '''# Node.js setup
+if [ -f "package.json" ] && [ ! -d "node_modules" ]; then
+    echo "Installing Node.js dependencies..."
+    npm install --silent
+fi
+
+'''
+    
+    if "rust" in project_types:
+        script += '''# Rust setup
+if [ -f "Cargo.toml" ]; then
+    echo "Building Rust project..."
+    cargo build --release
+fi
+
+'''
+    
+    script += '''echo "✅ Setup complete!"
+'''
+    return script
+
+
+def generate_entrypoint_py(metadata: dict, llm_findings: dict) -> str:
+    """Generate entrypoint.py with standard I/O contract."""
+    
+    llm_warning = ""
+    if llm_findings["has_llm_calls"]:
+        llm_warning = f'''
+# ⚠️  LLM USAGE DETECTED
+# This codebase makes LLM API calls ({", ".join(llm_findings["providers"])}).
+# Files with LLM calls: {", ".join(llm_findings["files"][:5])}
+#
+# These calls will FAIL in the OpenClaw sandbox (no API keys).
+# Replace them with sessions_spawn():
+#
+#     from openclaw import sessions_spawn
+#     result = sessions_spawn(
+#         task="Your prompt here",
+#         label="subtask-name",
+#         runTimeoutSeconds=300
+#     )
+#
+# See: https://docs.openclaw.ai/sessions-spawn
+'''
+
+    return '''#!/usr/bin/env python3
+"""
+Skill Entrypoint — Standard I/O Contract
+
+Input:  input/request.json
+Output: output/result.json
+
+This wrapper enables OpenClaw to invoke the skill uniformly.
+"""
+{llm_warning}
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+SKILL_DIR = Path(__file__).parent.parent
+VENDOR_DIR = SKILL_DIR / "vendor"
+INPUT_DIR = SKILL_DIR / "input"
+OUTPUT_DIR = SKILL_DIR / "output"
+
+
+def load_request() -> dict:
+    """Load the input request."""
+    request_file = INPUT_DIR / "request.json"
+    if not request_file.exists():
+        return {{"command": "help", "args": {{}}}}
+    return json.loads(request_file.read_text())
+
+
+def save_result(result: dict):
+    """Save the output result."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    result_file = OUTPUT_DIR / "result.json"
+    result_file.write_text(json.dumps(result, indent=2))
+    print(f"Result written to: {{result_file}}")
+
+
+def run_command(command: str, args: dict) -> dict:
+    """
+    Execute the vendored codebase.
+    
+    TODO: Map commands to actual codebase entry points.
+    This is a template — customize for {name}.
+    """
+    result = {{
+        "status": "ok",
+        "command": command,
+        "artifacts": [],
+        "summary": "",
+    }}
+    
+    try:
+        # Example: Run a Python module
+        # subprocess.run(
+        #     ["python", "-m", "your_module", command, json.dumps(args)],
+        #     cwd=VENDOR_DIR,
+        #     check=True
+        # )
+        
+        # Example: Run a Node.js script
+        # subprocess.run(
+        #     ["node", "bin/cli.js", command, json.dumps(args)],
+        #     cwd=VENDOR_DIR,
+        #     check=True
+        # )
+        
+        result["summary"] = f"Executed command: {{command}}"
+        result["status"] = "ok"
+        
+    except subprocess.CalledProcessError as e:
+        result["status"] = "error"
+        result["summary"] = f"Command failed: {{e}}"
+    except Exception as e:
+        result["status"] = "error"
+        result["summary"] = f"Error: {{e}}"
+    
+    return result
+
+
+def main():
+    # Ensure we're set up
+    venv_activate = SKILL_DIR / ".venv" / "bin" / "activate"
+    if not venv_activate.exists():
+        print("Run init.sh first to set up dependencies", file=sys.stderr)
+        sys.exit(1)
+    
+    # Load request
+    request = load_request()
+    command = request.get("command", "help")
+    args = request.get("args", {{}})
+    
+    print(f"Skill: {name}")
+    print(f"Command: {{command}}")
+    print(f"Args: {{args}}")
+    
+    # Execute
+    result = run_command(command, args)
+    
+    # Save output
+    save_result(result)
+    
+    # Return status
+    sys.exit(0 if result["status"] == "ok" else 1)
+
+
+if __name__ == "__main__":
+    main()
+'''.format(name=metadata["name"], llm_warning=llm_warning)
 
 
 def detect_entry_points(repo_path: Path, project_types: list[str]) -> list[str]:
@@ -410,6 +655,7 @@ def generate_skill(
     source: str,
     output_dir: Optional[Path] = None,
     keep_clone: bool = False,
+    vendor: bool = False,
 ) -> Path:
     """Generate a skill from a repository."""
     
@@ -478,15 +724,61 @@ def generate_skill(
             ref_name = Path(doc_file).name
             (refs_path / ref_name).write_text(content)
         
-        # Create scripts directory with placeholder
+        # Create scripts directory
         scripts_path = skill_path / "scripts"
         scripts_path.mkdir(exist_ok=True)
-        (scripts_path / ".gitkeep").touch()
+        
+        # Vendor the codebase if requested
+        if vendor:
+            print("Vendoring codebase...")
+            vendor_path = skill_path / "vendor"
+            if vendor_path.exists():
+                shutil.rmtree(vendor_path)
+            
+            # Copy the repo (excluding .git and other cruft)
+            def ignore_patterns(dir, files):
+                ignore = {".git", ".venv", "venv", "node_modules", "__pycache__", 
+                         ".pytest_cache", "target", "dist", ".next", ".cache"}
+                return [f for f in files if f in ignore]
+            
+            shutil.copytree(repo_path, vendor_path, ignore=ignore_patterns)
+            print(f"  Copied to vendor/")
+            
+            # Detect LLM usage
+            llm_findings = detect_llm_usage(repo_path)
+            if llm_findings["has_llm_calls"]:
+                print(f"  ⚠️  LLM API calls detected ({', '.join(llm_findings['providers'])})")
+                print(f"     Files: {', '.join(llm_findings['files'][:3])}")
+            
+            # Generate init.sh
+            init_script = generate_init_sh(project_types, metadata)
+            init_path = skill_path / "init.sh"
+            init_path.write_text(init_script)
+            init_path.chmod(0o755)
+            print(f"  Generated init.sh")
+            
+            # Generate entrypoint.py
+            entrypoint = generate_entrypoint_py(metadata, llm_findings)
+            (scripts_path / "entrypoint.py").write_text(entrypoint)
+            (scripts_path / "entrypoint.py").chmod(0o755)
+            print(f"  Generated scripts/entrypoint.py")
+            
+            # Create input/output dirs
+            (skill_path / "input").mkdir(exist_ok=True)
+            (skill_path / "output").mkdir(exist_ok=True)
+        else:
+            (scripts_path / ".gitkeep").touch()
         
         print(f"\n✅ Skill generated at: {skill_path}")
         print(f"   - SKILL.md")
         print(f"   - references/ ({len(key_files)} files)")
-        print(f"   - scripts/")
+        if vendor:
+            print(f"   - vendor/ (full codebase)")
+            print(f"   - init.sh (setup script)")
+            print(f"   - scripts/entrypoint.py (I/O contract)")
+            print(f"   - input/ & output/ (contract dirs)")
+        else:
+            print(f"   - scripts/")
         
         return skill_path
         
@@ -522,11 +814,16 @@ Examples:
         action="store_true",
         help="Keep the cloned repository (for URLs)",
     )
+    parser.add_argument(
+        "--vendor",
+        action="store_true",
+        help="Vendor the full codebase into the skill (enables execution)",
+    )
     
     args = parser.parse_args()
     
     try:
-        skill_path = generate_skill(args.source, args.output, args.keep_clone)
+        skill_path = generate_skill(args.source, args.output, args.keep_clone, args.vendor)
         print(f"\nNext steps:")
         print(f"  1. Review and edit {skill_path}/SKILL.md")
         print(f"  2. Add any custom scripts to {skill_path}/scripts/")
