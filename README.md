@@ -96,10 +96,37 @@ This enables any codebase to be invoked uniformly by OpenClaw or other orchestra
 - [x] Basic SKILL.md generation
 - [x] Project type detection
 - [x] Documentation extraction
-- [ ] Wrapper contract generation (`--with-wrapper`)
-- [ ] Dependency vendoring
-- [ ] `sessions_spawn` integration templates
+- [x] Wrapper contract generation (`--vendor`)
+- [x] Dependency vendoring
+- [x] `sessions_spawn` integration pattern
 - [ ] ClawHub publishing
+
+## sessions_spawn Integration
+
+Skills that need LLM capabilities can't call models directly (no API keys in sandbox). Instead, they return a "pending" status with the required action:
+
+```python
+def sessions_spawn(task: str, label: str, timeout: int = 300) -> dict:
+    """Request a sub-agent - orchestrator executes this."""
+    return {
+        "status": "pending",
+        "action": {
+            "tool": "sessions_spawn",
+            "params": {
+                "task": task,
+                "label": label,
+                "runTimeoutSeconds": timeout
+            }
+        }
+    }
+```
+
+The orchestrating agent:
+1. Runs the skill, gets `status: pending` with `action_required`
+2. Executes `sessions_spawn` with those params
+3. Passes result back to skill or handles directly
+
+See `examples/autoforge/entrypoint.py` for a full implementation.
 
 ## Part of Substr8 Labs
 
