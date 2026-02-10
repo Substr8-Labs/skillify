@@ -331,6 +331,8 @@ fi
 def generate_entrypoint_py(metadata: dict, llm_findings: dict) -> str:
     """Generate entrypoint.py with standard I/O contract."""
     
+    name = metadata["name"]
+    
     llm_warning = ""
     if llm_findings["has_llm_calls"]:
         llm_warning = f'''
@@ -341,7 +343,6 @@ def generate_entrypoint_py(metadata: dict, llm_findings: dict) -> str:
 # These calls will FAIL in the OpenClaw sandbox (no API keys).
 # Replace them with sessions_spawn():
 #
-#     from openclaw import sessions_spawn
 #     result = sessions_spawn(
 #         task="Your prompt here",
 #         label="subtask-name",
@@ -351,12 +352,17 @@ def generate_entrypoint_py(metadata: dict, llm_findings: dict) -> str:
 # See: https://docs.openclaw.ai/sessions-spawn
 '''
 
-    return '''#!/usr/bin/env python3
+    return f'''#!/usr/bin/env python3
 """
-Skill Entrypoint — Standard I/O Contract
+{name} Skill Entrypoint — Standard I/O Contract
 
 Input:  input/request.json
 Output: output/result.json
+
+Commands:
+  - help: Show available commands
+  - run: Execute the main functionality
+  - [add more commands as needed]
 
 This wrapper enables OpenClaw to invoke the skill uniformly.
 """
@@ -370,6 +376,9 @@ SKILL_DIR = Path(__file__).parent.parent
 VENDOR_DIR = SKILL_DIR / "vendor"
 INPUT_DIR = SKILL_DIR / "input"
 OUTPUT_DIR = SKILL_DIR / "output"
+
+# Add vendor to Python path for imports
+sys.path.insert(0, str(VENDOR_DIR))
 
 
 def load_request() -> dict:
@@ -388,41 +397,60 @@ def save_result(result: dict):
     print(f"Result written to: {{result_file}}")
 
 
-def run_command(command: str, args: dict) -> dict:
+def cmd_help(args: dict) -> dict:
+    """Show available commands."""
+    return {{
+        "status": "ok",
+        "summary": "{name} Skill - Available Commands",
+        "commands": {{
+            "help": "Show this help message",
+            "run": "Execute main functionality (customize this)",
+        }},
+        "artifacts": []
+    }}
+
+
+def cmd_run(args: dict) -> dict:
     """
     Execute the vendored codebase.
     
-    TODO: Map commands to actual codebase entry points.
-    This is a template — customize for {name}.
+    TODO: Customize this for {name}.
+    Map args to actual codebase entry points.
     """
     result = {{
         "status": "ok",
-        "command": command,
+        "command": "run",
         "artifacts": [],
         "summary": "",
     }}
     
     try:
         # Example: Run a Python module
-        # subprocess.run(
-        #     ["python", "-m", "your_module", command, json.dumps(args)],
+        # proc = subprocess.run(
+        #     ["python", "-m", "your_module", json.dumps(args)],
         #     cwd=VENDOR_DIR,
+        #     capture_output=True,
+        #     text=True,
         #     check=True
         # )
+        # result["summary"] = proc.stdout
         
         # Example: Run a Node.js script
-        # subprocess.run(
-        #     ["node", "bin/cli.js", command, json.dumps(args)],
+        # proc = subprocess.run(
+        #     ["node", "bin/cli.js", json.dumps(args)],
         #     cwd=VENDOR_DIR,
+        #     capture_output=True,
+        #     text=True,
         #     check=True
         # )
+        # result["summary"] = proc.stdout
         
-        result["summary"] = f"Executed command: {{command}}"
+        result["summary"] = "Executed successfully (customize cmd_run for {name})"
         result["status"] = "ok"
         
     except subprocess.CalledProcessError as e:
         result["status"] = "error"
-        result["summary"] = f"Command failed: {{e}}"
+        result["summary"] = f"Command failed: {{e.stderr or e}}"
     except Exception as e:
         result["status"] = "error"
         result["summary"] = f"Error: {{e}}"
@@ -430,13 +458,13 @@ def run_command(command: str, args: dict) -> dict:
     return result
 
 
+COMMANDS = {{
+    "help": cmd_help,
+    "run": cmd_run,
+}}
+
+
 def main():
-    # Ensure we're set up
-    venv_activate = SKILL_DIR / ".venv" / "bin" / "activate"
-    if not venv_activate.exists():
-        print("Run init.sh first to set up dependencies", file=sys.stderr)
-        sys.exit(1)
-    
     # Load request
     request = load_request()
     command = request.get("command", "help")
@@ -444,21 +472,33 @@ def main():
     
     print(f"Skill: {name}")
     print(f"Command: {{command}}")
-    print(f"Args: {{args}}")
+    print(f"Args: {{json.dumps(args)}}")
     
-    # Execute
-    result = run_command(command, args)
+    # Execute command
+    if command in COMMANDS:
+        result = COMMANDS[command](args)
+    else:
+        result = {{
+            "status": "error",
+            "summary": f"Unknown command: {{command}}",
+            "available_commands": list(COMMANDS.keys()),
+            "artifacts": []
+        }}
+    
+    # Ensure required fields
+    result.setdefault("command", command)
+    result.setdefault("artifacts", [])
     
     # Save output
     save_result(result)
     
     # Return status
-    sys.exit(0 if result["status"] == "ok" else 1)
+    sys.exit(0 if result.get("status") == "ok" else 1)
 
 
 if __name__ == "__main__":
     main()
-'''.format(name=metadata["name"], llm_warning=llm_warning)
+'''
 
 
 def detect_entry_points(repo_path: Path, project_types: list[str]) -> list[str]:
